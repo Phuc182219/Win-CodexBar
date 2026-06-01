@@ -196,16 +196,22 @@ impl CodexParserState {
         let Ok(obj) = serde_json::from_str::<Value>(line) else {
             return;
         };
-        let Some(day_key) = codex_line_day_key(&obj, range) else {
+        let Some(day_key) = codex_line_day_key(&obj) else {
             return;
         };
+        if day_key > range.until_key {
+            return;
+        }
 
         if obj.get("type").and_then(|v| v.as_str()) == Some("turn_context") {
             self.update_current_model(&obj);
         }
 
         if token_count_payload(&obj).is_some() {
-            self.record_token_count(&obj, day_key);
+            let record_day =
+                CostUsageDayRange::is_in_range(&day_key, &range.since_key, &range.until_key)
+                    .then_some(day_key);
+            self.record_token_count(&obj, record_day);
         }
     }
 
@@ -247,11 +253,14 @@ impl CodexParserState {
         }
     }
 
-    fn record_token_count(&mut self, obj: &Value, day_key: String) {
+    fn record_token_count(&mut self, obj: &Value, day_key: Option<String>) {
         let Some(payload) = token_count_payload(obj) else {
             return;
         };
         let Some((delta_input, delta_cached, delta_output)) = self.token_deltas(payload) else {
+            return;
+        };
+        let Some(day_key) = day_key else {
             return;
         };
         if delta_input == 0 && delta_cached == 0 && delta_output == 0 {
@@ -414,12 +423,9 @@ fn is_candidate_codex_line(line: &str) -> bool {
     !line.contains("\"type\":\"event_msg\"") || line.contains("\"token_count\"")
 }
 
-fn codex_line_day_key(obj: &Value, range: &CostUsageDayRange) -> Option<String> {
+fn codex_line_day_key(obj: &Value) -> Option<String> {
     let ts = obj.get("timestamp").and_then(|v| v.as_str())?;
-    let day_key = ts.get(..10)?;
-
-    CostUsageDayRange::is_in_range(day_key, &range.scan_since_key, &range.scan_until_key)
-        .then(|| day_key.to_string())
+    ts.get(..10).map(str::to_string)
 }
 
 fn token_count_payload(obj: &Value) -> Option<&Value> {

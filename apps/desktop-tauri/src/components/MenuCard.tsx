@@ -79,6 +79,8 @@ const DEMO_LOCAL_USAGE: Record<string, ProviderLocalUsageSummary> = {
     todayCost: 75.24,
     thirtyDayCost: 3442.16,
     thirtyDayTokens: 4_700_000_000,
+    allTimeCost: 12_640.35,
+    allTimeTokens: 18_400_000_000,
     latestTokens: 115_000_000,
     topModel: "gpt-5.5",
     estimateNote: "Estimated from local logs; may differ from your bill",
@@ -87,6 +89,8 @@ const DEMO_LOCAL_USAGE: Record<string, ProviderLocalUsageSummary> = {
     todayCost: null,
     thirtyDayCost: null,
     thirtyDayTokens: 584_000,
+    allTimeCost: null,
+    allTimeTokens: null,
     latestTokens: 352_000,
     topModel: "glm-4.6",
     estimateNote:
@@ -127,6 +131,8 @@ function LocalUsageBlock({
     .slice(-30)
     .filter((point) => point.value > 0);
   const maxCost = Math.max(...visibleHistory.map((point) => point.value), 0);
+  const showAllTimeCost = isCodex && summary.allTimeCost != null;
+  const showAllTimeTokens = isCodex && summary.allTimeTokens != null;
 
   return (
     <section className="menu-card__group menu-card__local-usage">
@@ -155,6 +161,18 @@ function LocalUsageBlock({
           <span className="menu-card__local-label">Latest tokens</span>
           <strong>{formatCompactCount(summary.latestTokens)}</strong>
         </div>
+        {showAllTimeCost && (
+          <div>
+            <span className="menu-card__local-label">All-time cost</span>
+            <strong>{formatCurrency(summary.allTimeCost!, "USD")}</strong>
+          </div>
+        )}
+        {showAllTimeTokens && (
+          <div>
+            <span className="menu-card__local-label">All-time tokens</span>
+            <strong>{formatCompactCount(summary.allTimeTokens)}</strong>
+          </div>
+        )}
       </div>
 
       {isCodex && visibleHistory.length > 0 && (
@@ -351,7 +369,12 @@ export default function MenuCard({
     return () => {
       cancelled = true;
     };
-  }, [provider.providerId, provider.accountEmail, onLayoutChange]);
+  }, [
+    provider.providerId,
+    provider.accountEmail,
+    provider.updatedAt,
+    onLayoutChange,
+  ]);
 
   const email = provider.accountEmail
     ? hideEmail

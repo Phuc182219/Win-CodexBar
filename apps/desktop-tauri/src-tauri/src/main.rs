@@ -133,6 +133,7 @@ fn main() {
             commands::is_remote_session,
             commands::get_launch_block_reason,
             commands::get_work_area_rect,
+            commands::start_tray_panel_drag,
             commands::play_notification_sound,
             commands::open_external_url,
             commands::reanchor_tray_panel,
@@ -203,11 +204,16 @@ fn main() {
                     // Grace period: ignore blur within 500ms of showing the panel.
                     // On Windows, the tray click can cause a spurious blur before
                     // the window fully acquires focus.
-                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
-                        && let Some(shown_at) = st.lock().unwrap().last_shown_at
-                        && shown_at.elapsed() < Duration::from_millis(500)
-                    {
-                        return;
+                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>() {
+                        let mut guard = st.lock().unwrap();
+                        if guard.should_suppress_tray_blur_dismiss(std::time::Instant::now()) {
+                            return;
+                        }
+                        if let Some(shown_at) = guard.last_shown_at
+                            && shown_at.elapsed() < Duration::from_millis(500)
+                        {
+                            return;
+                        }
                     }
                     // Blur in TrayPanel mode → auto-hide.
                     let _ = shell::hide_to_tray_if_current(window.app_handle(), |mode| {
@@ -215,6 +221,11 @@ fn main() {
                     });
                 }
                 tauri::WindowEvent::Moved(_) | tauri::WindowEvent::Resized(_) => {
+                    if let Some(st) = window.app_handle().try_state::<Mutex<AppState>>()
+                        && let Ok(mut guard) = st.lock()
+                    {
+                        guard.extend_tray_drag_blur_suppression_for(Duration::from_millis(750));
+                    }
                     // Capture geometry for surfaces eligible for persistence
                     // (currently only Settings). The helper is a no-op when the
                     // current surface is not eligible.

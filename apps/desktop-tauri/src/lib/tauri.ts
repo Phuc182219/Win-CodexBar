@@ -376,6 +376,10 @@ export function revealTrayPanelWindow(): Promise<void> {
   return invoke<void>("reveal_tray_panel_window");
 }
 
+export function startTrayPanelDrag(): Promise<void> {
+  return invoke<void>("start_tray_panel_drag");
+}
+
 export function quitApp(): Promise<void> {
   return invoke<void>("quit_app");
 }

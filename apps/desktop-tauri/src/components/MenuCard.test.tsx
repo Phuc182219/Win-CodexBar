@@ -88,6 +88,8 @@ describe("MenuCard", () => {
         todayCost: null,
         thirtyDayCost: 1.23,
         thirtyDayTokens: 584_000,
+        allTimeCost: null,
+        allTimeTokens: null,
         latestTokens: null,
         topModel: "glim-4.6",
         estimateNote: "Estimated from local logs",
@@ -146,5 +148,99 @@ describe("MenuCard", () => {
     expect(screen.getByText("30d tokens")).toBeInTheDocument();
     expect(screen.getByText("584K")).toBeInTheDocument();
     expect(screen.getByText("Estimated from local logs")).toBeInTheDocument();
+  });
+
+  it("keeps 30d tokens and adds Codex all-time totals when available", async () => {
+    tauriMocks.getProviderChartData.mockResolvedValueOnce({
+      providerId: "codex",
+      costHistory: [{ date: "2026-05-24", value: 1.23 }],
+      creditsHistory: [],
+      usageBreakdown: [],
+      localUsage: {
+        todayCost: 2.58,
+        thirtyDayCost: 12.34,
+        thirtyDayTokens: 515_300_000,
+        allTimeCost: 617.2,
+        allTimeTokens: 843_806_312,
+        latestTokens: 32_800_000,
+        topModel: "gpt-5.5",
+        estimateNote: "Estimated from local logs",
+      },
+    });
+
+    renderCard({
+      ...provider(null),
+      providerId: "codex",
+      displayName: "Codex",
+    });
+
+    expect(await screen.findByText("30d tokens")).toBeInTheDocument();
+    expect(screen.getByText("515.3M")).toBeInTheDocument();
+    expect(screen.getByText("All-time cost")).toBeInTheDocument();
+    expect(screen.getByText("$617.20")).toBeInTheDocument();
+    expect(screen.getByText("All-time tokens")).toBeInTheDocument();
+    expect(screen.getByText("843.8M")).toBeInTheDocument();
+    expect(screen.getByText("Top model: gpt-5.5")).toBeInTheDocument();
+  });
+
+  it("refreshes local usage when the provider snapshot updates", async () => {
+    tauriMocks.getProviderChartData
+      .mockResolvedValueOnce({
+        providerId: "claude",
+        costHistory: [{ date: "2026-05-24", value: 1.23 }],
+        creditsHistory: [],
+        usageBreakdown: [],
+        localUsage: {
+          todayCost: null,
+          thirtyDayCost: 1.23,
+          thirtyDayTokens: 584_000,
+          allTimeCost: null,
+          allTimeTokens: null,
+          latestTokens: null,
+          topModel: "glm-4.6",
+          estimateNote: "Estimated from local logs",
+        },
+      })
+      .mockResolvedValueOnce({
+        providerId: "claude",
+        costHistory: [{ date: "2026-05-24", value: 3.81 }],
+        creditsHistory: [],
+        usageBreakdown: [],
+        localUsage: {
+          todayCost: 2.58,
+          thirtyDayCost: 3.81,
+          thirtyDayTokens: 2_959_934,
+          allTimeCost: null,
+          allTimeTokens: null,
+          latestTokens: 2_375_934,
+          topModel: "glm-4.6",
+          estimateNote: "Estimated from local logs",
+        },
+      });
+
+    const initialProvider = provider(null);
+    const view = renderCard(initialProvider);
+
+    expect(await screen.findByText("30d cost")).toBeInTheDocument();
+    expect(screen.getAllByText("$1.23").length).toBeGreaterThan(0);
+
+    view.rerender(
+      <LocaleProvider>
+        <MenuCard
+          provider={{
+            ...initialProvider,
+            updatedAt: "2026-05-24T00:01:00Z",
+          }}
+          hideEmail={false}
+          resetTimeRelative={true}
+        />
+      </LocaleProvider>,
+    );
+
+    await waitFor(() => {
+      expect(tauriMocks.getProviderChartData).toHaveBeenCalledTimes(2);
+    });
+    expect(await screen.findByText("$2.58")).toBeInTheDocument();
+    expect(screen.getByText("2.4M")).toBeInTheDocument();
   });
 });

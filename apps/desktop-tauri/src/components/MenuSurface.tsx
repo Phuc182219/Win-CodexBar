@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { PointerEventHandler, ReactNode } from "react";
 import { useLocale } from "../hooks/useLocale";
 
 export interface MenuSurfaceAction {
@@ -19,6 +19,10 @@ interface MenuSurfaceProps {
   onRefresh: () => void;
   isRefreshing: boolean;
   actions: MenuSurfaceAction[];
+  onDragHandlePointerDown?: PointerEventHandler<HTMLDivElement>;
+  onDragHandlePointerMove?: PointerEventHandler<HTMLDivElement>;
+  onDragHandlePointerUp?: PointerEventHandler<HTMLDivElement>;
+  onDragHandlePointerCancel?: PointerEventHandler<HTMLDivElement>;
   summary?: ReactNode;
   banner?: ReactNode;
   footerRows?: MenuFooterRow[];
@@ -38,6 +42,10 @@ export default function MenuSurface({
   onRefresh,
   isRefreshing,
   actions,
+  onDragHandlePointerDown,
+  onDragHandlePointerMove,
+  onDragHandlePointerUp,
+  onDragHandlePointerCancel,
   summary,
   banner,
   footerRows,
@@ -45,6 +53,20 @@ export default function MenuSurface({
 }: MenuSurfaceProps) {
   return (
     <div className={`menu-surface menu-surface--${variant}`}>
+      {variant === "tray" && (
+        <div
+          className="menu-surface__drag-handle"
+          title="Drag panel"
+          aria-label="Drag panel"
+          onPointerDown={onDragHandlePointerDown}
+          onPointerMove={onDragHandlePointerMove}
+          onPointerUp={onDragHandlePointerUp}
+          onPointerCancel={onDragHandlePointerCancel}
+          onLostPointerCapture={onDragHandlePointerCancel}
+        >
+          <span className="menu-surface__drag-grip" />
+        </div>
+      )}
       {banner}
       {summary}
       <div className="menu-surface__body">{children}</div>

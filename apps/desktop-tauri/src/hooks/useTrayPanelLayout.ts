@@ -17,6 +17,7 @@ export interface TrayPanelLayoutOptions {
   denseOverview: boolean;
   detailMode: boolean;
   layoutKey: string;
+  allowReanchor?: boolean;
 }
 
 export interface TrayPanelLayout {
@@ -29,6 +30,7 @@ export function useTrayPanelLayout({
   denseOverview,
   detailMode,
   layoutKey,
+  allowReanchor = true,
 }: TrayPanelLayoutOptions): TrayPanelLayout {
   const [layoutReady, setLayoutReady] = useState(false);
   const [layoutRevision, setLayoutRevision] = useState(0);
@@ -36,17 +38,21 @@ export function useTrayPanelLayout({
   const resizeRunRef = useRef(0);
   const layoutTimerRef = useRef<number | undefined>(undefined);
   const lastSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const forceNextResizeRef = useRef(false);
+  const mountedRef = useRef(true);
 
   const requestLayout = useCallback(() => {
     if (layoutTimerRef.current !== undefined) {
       window.clearTimeout(layoutTimerRef.current);
     }
     layoutTimerRef.current = window.setTimeout(() => {
+      if (!mountedRef.current) return;
       setLayoutRevision((current) => current + 1);
     }, layoutReadyRef.current ? 100 : 16);
   }, []);
 
   useEffect(() => {
+    forceNextResizeRef.current = true;
     requestLayout();
   }, [layoutKey, requestLayout]);
 
@@ -60,6 +66,7 @@ export function useTrayPanelLayout({
 
   useEffect(() => {
     return () => {
+      mountedRef.current = false;
       if (layoutTimerRef.current !== undefined) {
         window.clearTimeout(layoutTimerRef.current);
       }
@@ -166,14 +173,21 @@ export function useTrayPanelLayout({
         committedHeight = true;
 
         const previousSize = lastSizeRef.current;
+        const forceResize = forceNextResizeRef.current;
         const shouldResize =
+          forceResize ||
           previousSize === null ||
           previousSize.width !== TRAY_WIDTH ||
           Math.abs(previousSize.height - height) > 2;
         if (shouldResize) {
           await win.setSize(new LogicalSize(TRAY_WIDTH, height));
           lastSizeRef.current = { width: TRAY_WIDTH, height };
-          await Promise.resolve(reanchorTrayPanel()).catch(() => {});
+          forceNextResizeRef.current = false;
+          if (allowReanchor) {
+            await Promise.resolve(reanchorTrayPanel()).catch(() => {});
+          }
+        } else {
+          forceNextResizeRef.current = false;
         }
 
         await revealPanel();
@@ -209,7 +223,7 @@ export function useTrayPanelLayout({
       window.clearTimeout(timer);
       resizeRunRef.current += 1;
     };
-  }, [canMeasure, denseOverview, detailMode, layoutRevision]);
+  }, [allowReanchor, canMeasure, denseOverview, detailMode, layoutRevision]);
 
   return { layoutReady, requestLayout };
 }

@@ -1,7 +1,13 @@
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { BootstrapState, ProviderUsageSnapshot } from "../types/bridge";
-import { setSurfaceMode, openSettingsWindow, quitApp as quitApplication } from "../lib/tauri";
+import {
+  setSurfaceMode,
+  openSettingsWindow,
+  quitApp as quitApplication,
+  startTrayPanelDrag,
+} from "../lib/tauri";
 import { useProviders } from "../hooks/useProviders";
 import { useSettings } from "../hooks/useSettings";
 import { useUpdateState } from "../hooks/useUpdateState";
@@ -75,6 +81,14 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     useUpdateState();
   const { t } = useLocale();
   const surfaceTarget = useSurfaceTarget("trayPanel");
+  const updateLayoutKey = [
+    updateState.status,
+    updateState.version ?? "",
+    updateState.error ?? "",
+    updateState.progress ?? "",
+    updateState.canDownload ? "download" : "",
+    updateState.canApply ? "apply" : "",
+  ].join("|");
 
   const sorted = useMemo(
     () => orderProviderSnapshots(providers, state.providers, settings.enabledProviders),
@@ -96,6 +110,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     initialProviderId,
   );
   const [gridExpanded, setGridExpanded] = useState(false);
+  const [manualPositioned, setManualPositioned] = useState(false);
   const expectsDenseOverview =
     selectedProviderId === null &&
     !gridExpanded &&
@@ -108,6 +123,17 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   useEffect(() => {
     setSelectedProviderId(initialProviderId);
   }, [initialProviderId]);
+
+  const handleDragPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button > 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setManualPositioned(true);
+      void startTrayPanelDrag().catch(() => {});
+    },
+    [],
+  );
 
   // Cards to display based on mode
   // Overview: all providers in the grid — non-error first, then errors
@@ -139,9 +165,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         selectedProviderId ?? "overview",
         gridExpanded ? "expanded" : "collapsed",
         isRefreshing ? "refreshing" : "idle",
-        updateState.status,
-        updateState.version ?? "",
-        updateState.error ?? "",
+        updateLayoutKey,
         expectsDenseOverview ? "dense" : "normal",
         hasLoadedCache ? "cache-ready" : "cache-pending",
         visibleProviders.map((provider) => provider.providerId).join(","),
@@ -150,9 +174,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       selectedProviderId,
       gridExpanded,
       isRefreshing,
-      updateState.status,
-      updateState.version,
-      updateState.error,
+      updateLayoutKey,
       expectsDenseOverview,
       hasLoadedCache,
       visibleProviders,
@@ -164,7 +186,10 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     denseOverview: expectsDenseOverview,
     detailMode: selectedProviderId !== null,
     layoutKey,
+    allowReanchor: !manualPositioned,
   });
+        // Also check the footer explicitly — it may lay out below the
+        // First layout pass complete — reveal the panel.
 
   const openSettings = useCallback(() => {
     void openSettingsWindow("general").finally(() => {
@@ -262,6 +287,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         onRefresh={refresh}
         isRefreshing={isRefreshing}
         actions={headerActions}
+        onDragHandlePointerDown={handleDragPointerDown}
         banner={banner}
         footerRows={footerRows}
       >
@@ -297,6 +323,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
               </Fragment>
             );
           })}
+      {/* Context actions — detail mode only, matches macOS actionsSection */}
         </div>
         {/* Context actions — detail mode only, matches macOS actionsSection */}
         {selectedProviderId && (HAS_DASHBOARD.has(selectedProviderId) || HAS_STATUS_PAGE.has(selectedProviderId)) && (
