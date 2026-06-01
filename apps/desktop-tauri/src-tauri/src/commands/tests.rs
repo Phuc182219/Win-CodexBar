@@ -772,7 +772,10 @@ fn non_claude_error_message_is_preserved() {
 
 #[test]
 fn chart_data_serde_roundtrip_preserves_fields() {
-    use super::{DailyCostPoint, DailyUsageBreakdown, ProviderChartData, ServiceUsagePoint};
+    use super::{
+        DailyCostPoint, DailyUsageBreakdown, ProviderChartData, ProviderLocalUsageSummary,
+        ServiceUsagePoint,
+    };
 
     let original = ProviderChartData {
         provider_id: "codex".into(),
@@ -804,7 +807,16 @@ fn chart_data_serde_roundtrip_preserves_fields() {
             ],
             total_credits_used: 13.5,
         }],
-        local_usage: None,
+        local_usage: Some(ProviderLocalUsageSummary {
+            today_cost: Some(2.58),
+            thirty_day_cost: Some(12.34),
+            thirty_day_tokens: Some(515_300_000),
+            all_time_cost: Some(617.2),
+            all_time_tokens: Some(843_806_312),
+            latest_tokens: Some(32_800_000),
+            top_model: Some("gpt-5.5".into()),
+            estimate_note: "Estimated from local logs".into(),
+        }),
     };
 
     let json = serde_json::to_string(&original).expect("serialize");
@@ -815,7 +827,9 @@ fn chart_data_serde_roundtrip_preserves_fields() {
     assert!(json.contains("\"costHistory\""));
     assert!(json.contains("\"creditsHistory\""));
     assert!(json.contains("\"usageBreakdown\""));
-    assert!(json.contains("\"localUsage\":null"));
+    assert!(json.contains("\"localUsage\":"));
+    assert!(json.contains("\"allTimeCost\":617.2"));
+    assert!(json.contains("\"allTimeTokens\":843806312"));
     assert!(json.contains("\"creditsUsed\":10.0"));
     assert!(json.contains("\"totalCreditsUsed\":13.5"));
 
@@ -826,6 +840,9 @@ fn chart_data_serde_roundtrip_preserves_fields() {
     assert_eq!(back.credits_history[0].value, 42.0);
     assert_eq!(back.usage_breakdown[0].services.len(), 2);
     assert_eq!(back.usage_breakdown[0].total_credits_used, 13.5);
+    let local_usage = back.local_usage.expect("local usage");
+    assert_eq!(local_usage.all_time_cost, Some(617.2));
+    assert_eq!(local_usage.all_time_tokens, Some(843_806_312));
 }
 
 #[test]

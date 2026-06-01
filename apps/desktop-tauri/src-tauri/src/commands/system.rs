@@ -181,6 +181,20 @@ pub fn get_work_area_rect(app: tauri::AppHandle) -> Result<WorkAreaRect, String>
 // ── Misc UX ────────────────────────────────────────────────────────────
 
 #[tauri::command]
+pub fn start_tray_panel_drag(app: tauri::AppHandle) -> Result<(), String> {
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window unavailable".to_string())?;
+
+    if let Some(st) = app.try_state::<Mutex<AppState>>() {
+        let mut guard = st.lock().map_err(|_| "app state unavailable".to_string())?;
+        guard.suppress_tray_drag_blur_for(std::time::Duration::from_millis(1200));
+    }
+
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn play_notification_sound() -> Result<(), String> {
     // Use the shared sound helper, honouring the user's `sound_enabled` flag.
     let settings = Settings::load();

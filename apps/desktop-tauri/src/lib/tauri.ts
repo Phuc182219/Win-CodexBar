@@ -372,6 +372,10 @@ export function reanchorTrayPanel(): Promise<void> {
   return invoke<void>("reanchor_tray_panel");
 }
 
+export function startTrayPanelDrag(): Promise<void> {
+  return invoke<void>("start_tray_panel_drag");
+}
+
 export function quitApp(): Promise<void> {
   return invoke<void>("quit_app");
 }

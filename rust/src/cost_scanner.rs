@@ -9,8 +9,12 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::{CostUsageDayRange, CostUsagePricing, JsonlScanner};
+use crate::core::{
+    CostUsageCache, CostUsageDayRange, CostUsageFileUsage, CostUsagePricing, JsonlScanner,
+    ProviderId,
+};
 
 /// Cost summary from scanning local logs
 #[derive(Debug, Clone, Default)]
@@ -174,12 +178,22 @@ struct ClaudeUsage {
 /// Cost usage scanner
 pub struct CostScanner {
     days: u32,
+    cache_root: Option<PathBuf>,
 }
 
 impl CostScanner {
     /// Create a new scanner for the last N days
     pub fn new(days: u32) -> Self {
-        Self { days }
+        Self {
+            days,
+            cache_root: None,
+        }
+    }
+
+    /// Override the on-disk cache root. Mainly used by tests.
+    pub fn with_cache_root(mut self, cache_root: impl Into<PathBuf>) -> Self {
+        self.cache_root = Some(cache_root.into());
+        self
     }
 
     /// Scan Codex local logs
@@ -194,42 +208,58 @@ impl CostScanner {
             return CostSummary::default();
         }
 
-        let mut summary = CostSummary::default();
-        let today = Utc::now().date_naive();
-        let start_date = today - Duration::days(self.days as i64);
+        self.scan_codex_sessions_dir_with_cancel(&sessions_dir, cancel)
+    }
 
-        summary.period_start = Some(start_date);
-        summary.period_end = Some(today);
+    /// Scan all available Codex local logs.
+    pub fn scan_codex_all_time(&self) -> CostSummary {
+        self.scan_codex_all_time_with_cancel(None)
+    }
 
-        // Iterate through date-based directory structure
-        for days_ago in 0..self.days {
-            if is_cancelled(cancel) {
-                break;
-            }
-            let date = today - Duration::days(days_ago as i64);
-            let year = date.format("%Y").to_string();
-            let month = date.format("%m").to_string();
-            let day = date.format("%d").to_string();
-
-            let day_dir = sessions_dir.join(&year).join(&month).join(&day);
-            if !day_dir.exists() {
-                continue;
-            }
-
-            if let Ok(entries) = fs::read_dir(&day_dir) {
-                for entry in entries.flatten() {
-                    if is_cancelled(cancel) {
-                        break;
-                    }
-                    let path = entry.path();
-                    if path.extension().is_some_and(|e| e == "jsonl") {
-                        self.parse_codex_file(&path, &mut summary, cancel);
-                    }
-                }
-            }
+    /// Scan all available Codex local logs, stopping early when the caller cancels the scan.
+    pub fn scan_codex_all_time_with_cancel(&self, cancel: Option<&AtomicBool>) -> CostSummary {
+        let sessions_dir = self.get_codex_sessions_dir();
+        if !sessions_dir.exists() {
+            return CostSummary::default();
         }
 
-        summary
+        self.scan_codex_sessions_dir_all_time_with_cancel(&sessions_dir, cancel)
+    }
+
+    #[cfg(test)]
+    fn scan_codex_sessions_dir(&self, sessions_dir: &Path) -> CostSummary {
+        self.scan_codex_sessions_dir_with_cancel(sessions_dir, None)
+    }
+
+    fn scan_codex_sessions_dir_with_cancel(
+        &self,
+        sessions_dir: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> CostSummary {
+        let today = Utc::now().date_naive();
+        let start_date = today - Duration::days(self.days.saturating_sub(1) as i64);
+        let range = CostUsageDayRange::new(start_date, today);
+
+        let cache = self.scan_codex_cached_usage(sessions_dir, today, cancel);
+        self.summarize_codex_cache(&cache, &range, start_date, today)
+    }
+
+    #[cfg(test)]
+    fn scan_codex_sessions_dir_all_time(&self, sessions_dir: &Path) -> CostSummary {
+        self.scan_codex_sessions_dir_all_time_with_cancel(sessions_dir, None)
+    }
+
+    fn scan_codex_sessions_dir_all_time_with_cancel(
+        &self,
+        sessions_dir: &Path,
+        cancel: Option<&AtomicBool>,
+    ) -> CostSummary {
+        let today = Utc::now().date_naive();
+        let start_date = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid all-time start date");
+        let range = CostUsageDayRange::new(start_date, today);
+
+        let cache = self.scan_codex_cached_usage(sessions_dir, today, cancel);
+        self.summarize_codex_cache(&cache, &range, start_date, today)
     }
 
     /// Scan Claude local logs
@@ -291,17 +321,10 @@ impl CostScanner {
         home.join(".config").join("claude").join("projects")
     }
 
-    fn parse_codex_file(
-        &self,
-        path: &PathBuf,
-        summary: &mut CostSummary,
-        cancel: Option<&AtomicBool>,
-    ) {
-        if is_cancelled(cancel) {
-            return;
-        }
+    #[cfg(test)]
+    fn parse_codex_file(&self, path: &Path, summary: &mut CostSummary) {
         let today = Utc::now().date_naive();
-        let start_date = today - Duration::days(self.days as i64);
+        let start_date = today - Duration::days(self.days.saturating_sub(1) as i64);
         let range = CostUsageDayRange::new(start_date, today);
         let parse_result = match JsonlScanner::parse_codex_file(path, &range, 0, None, None) {
             Ok(result) => result,
@@ -316,9 +339,176 @@ impl CostScanner {
         }
     }
 
+    fn scan_codex_cached_usage(
+        &self,
+        sessions_dir: &Path,
+        today: NaiveDate,
+        cancel: Option<&AtomicBool>,
+    ) -> CostUsageCache {
+        let all_time_start =
+            NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid all-time start date");
+        let range = CostUsageDayRange::new(all_time_start, today);
+        let previous = JsonlScanner::load_cache(ProviderId::Codex, self.cache_root.as_deref());
+        let mut next = CostUsageCache {
+            last_scan_unix_ms: Utc::now().timestamp_millis(),
+            files: HashMap::new(),
+            days: HashMap::new(),
+        };
+
+        self.scan_codex_cache_dir(sessions_dir, &range, &previous, &mut next, cancel);
+        if !is_cancelled(cancel) {
+            JsonlScanner::save_cache(ProviderId::Codex, &next, self.cache_root.as_deref());
+        }
+        next
+    }
+
+    fn scan_codex_cache_dir(
+        &self,
+        dir: &Path,
+        range: &CostUsageDayRange,
+        previous: &CostUsageCache,
+        next: &mut CostUsageCache,
+        cancel: Option<&AtomicBool>,
+    ) {
+        if is_cancelled(cancel) {
+            return;
+        }
+
+        let entries = match fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            if is_cancelled(cancel) {
+                break;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                self.scan_codex_cache_dir(&path, range, previous, next, cancel);
+            } else if path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+                && let Some(file_usage) =
+                    self.cached_codex_file_usage(&path, range, previous, cancel)
+            {
+                merge_codex_days(&mut next.days, &file_usage.days);
+                next.files.insert(codex_cache_key(&path), file_usage);
+            }
+        }
+    }
+
+    fn cached_codex_file_usage(
+        &self,
+        path: &Path,
+        range: &CostUsageDayRange,
+        previous: &CostUsageCache,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<CostUsageFileUsage> {
+        if is_cancelled(cancel) {
+            return None;
+        }
+
+        let metadata = fs::metadata(path).ok()?;
+        let size = metadata.len() as i64;
+        let mtime_unix_ms = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_to_unix_ms)
+            .unwrap_or(0);
+        let key = codex_cache_key(path);
+        let previous_file = previous.files.get(&key);
+
+        if let Some(cached) = previous_file
+            && cached.mtime_unix_ms == mtime_unix_ms
+            && cached.size == size
+        {
+            return Some(cached.clone());
+        }
+
+        let can_parse_incrementally = previous_file
+            .and_then(|cached| cached.parsed_bytes)
+            .is_some_and(|parsed_bytes| parsed_bytes > 0 && parsed_bytes <= size);
+        let start_offset = if can_parse_incrementally {
+            previous_file
+                .and_then(|cached| cached.parsed_bytes)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let initial_model = can_parse_incrementally
+            .then(|| previous_file.and_then(|cached| cached.last_model.clone()))
+            .flatten();
+        let initial_totals = can_parse_incrementally
+            .then(|| previous_file.and_then(|cached| cached.last_totals.clone()))
+            .flatten();
+        let mut days = if can_parse_incrementally {
+            previous_file
+                .map(|cached| cached.days.clone())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        let parse_result = match JsonlScanner::parse_codex_file(
+            path,
+            range,
+            start_offset,
+            initial_model,
+            initial_totals,
+        ) {
+            Ok(result) => result,
+            Err(_) => return previous_file.cloned(),
+        };
+        if is_cancelled(cancel) {
+            return None;
+        }
+        merge_codex_days(&mut days, &parse_result.days);
+
+        Some(CostUsageFileUsage {
+            mtime_unix_ms,
+            size,
+            days,
+            parsed_bytes: Some(parse_result.parsed_bytes),
+            last_model: parse_result.last_model,
+            last_totals: parse_result.last_totals,
+        })
+    }
+
+    fn summarize_codex_cache(
+        &self,
+        cache: &CostUsageCache,
+        range: &CostUsageDayRange,
+        start_date: NaiveDate,
+        today: NaiveDate,
+    ) -> CostSummary {
+        let mut summary = CostSummary {
+            period_start: Some(start_date),
+            period_end: Some(today),
+            ..CostSummary::default()
+        };
+
+        for file_usage in cache.files.values() {
+            let mut ranged_days = HashMap::new();
+            for (day, models) in &file_usage.days {
+                if CostUsageDayRange::is_in_range(day, &range.since_key, &range.until_key) {
+                    ranged_days.insert(day.clone(), models.clone());
+                }
+            }
+
+            let (session_cost, has_tokens) = add_codex_days_to_summary(&mut summary, &ranged_days);
+            if has_tokens {
+                summary.total_cost_usd += session_cost;
+                summary.sessions_count += 1;
+            }
+        }
+
+        summary
+    }
+
     fn scan_claude_dir(
         &self,
-        dir: &PathBuf,
+        dir: &Path,
         cutoff: &DateTime<Utc>,
         summary: &mut CostSummary,
         cancel: Option<&AtomicBool>,
@@ -326,6 +516,7 @@ impl CostScanner {
         if is_cancelled(cancel) {
             return;
         }
+
         let entries = match fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -354,7 +545,7 @@ impl CostScanner {
 
     fn parse_claude_file(
         &self,
-        path: &PathBuf,
+        path: &Path,
         summary: &mut CostSummary,
         cancel: Option<&AtomicBool>,
     ) {
@@ -430,6 +621,33 @@ impl CostScanner {
 }
 
 type CodexDays = HashMap<String, HashMap<String, Vec<i32>>>;
+
+fn codex_cache_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn system_time_to_unix_ms(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+fn merge_codex_days(target: &mut CodexDays, source: &CodexDays) {
+    for (day, models) in source {
+        let target_models = target.entry(day.clone()).or_default();
+        for (model, packed) in models {
+            let target_packed = target_models
+                .entry(model.clone())
+                .or_insert_with(|| vec![0, 0, 0]);
+            if target_packed.len() < 3 {
+                target_packed.resize(3, 0);
+            }
+            for (index, value) in target_packed.iter_mut().enumerate().take(3) {
+                *value += packed.get(index).copied().unwrap_or(0);
+            }
+        }
+    }
+}
 
 fn add_codex_days_to_summary(summary: &mut CostSummary, days: &CodexDays) -> (f64, bool) {
     let mut total_cost = 0.0;
@@ -521,29 +739,16 @@ pub fn get_daily_cost_history(provider: &str, days: u32) -> Vec<(String, f64)> {
 
     match provider {
         "codex" => {
-            // Scan Codex logs by day
             let sessions_dir = scanner.get_codex_sessions_dir();
             if sessions_dir.exists() {
+                let cache = scanner.scan_codex_cached_usage(&sessions_dir, today, None);
                 for days_ago in 0..days {
                     let date = today - Duration::days(days_ago as i64);
                     let date_str = date.format("%Y-%m-%d").to_string();
-                    let year = date.format("%Y").to_string();
-                    let month = date.format("%m").to_string();
-                    let day = date.format("%d").to_string();
-
-                    let day_dir = sessions_dir.join(&year).join(&month).join(&day);
-                    if day_dir.exists() {
-                        let mut day_cost = 0.0;
-                        if let Ok(entries) = fs::read_dir(&day_dir) {
-                            for entry in entries.flatten() {
-                                let path = entry.path();
-                                if path.extension().is_some_and(|e| e == "jsonl") {
-                                    let range = CostUsageDayRange::new(date, date);
-                                    day_cost += scan_codex_file_cost_for_range(&path, &range);
-                                }
-                            }
-                        }
-                        daily_costs.insert(date_str, day_cost);
+                    if let Some(models) = cache.days.get(&date_str) {
+                        let mut day = HashMap::new();
+                        day.insert(date_str.clone(), models.clone());
+                        daily_costs.insert(date_str, codex_days_cost(&day));
                     }
                 }
             }
@@ -577,6 +782,7 @@ fn scan_codex_file_cost(path: &Path) -> f64 {
     scan_codex_file_cost_for_range(path, &range)
 }
 
+#[cfg(test)]
 fn scan_codex_file_cost_for_range(path: &Path, range: &CostUsageDayRange) -> f64 {
     let parse_result = match JsonlScanner::parse_codex_file(path, range, 0, None, None) {
         Ok(result) => result,
@@ -589,6 +795,7 @@ fn scan_codex_file_cost_for_range(path: &Path, range: &CostUsageDayRange) -> f64
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     #[test]
@@ -638,7 +845,7 @@ mod tests {
 
         let scanner = CostScanner::new(30);
         let mut summary = CostSummary::default();
-        scanner.parse_codex_file(&path, &mut summary, None);
+        scanner.parse_codex_file(&path, &mut summary);
 
         assert_eq!(summary.sessions_count, 1);
         assert_eq!(summary.input_tokens, 125);
@@ -653,5 +860,243 @@ mod tests {
         );
         assert!(scan_codex_file_cost(&path) > 0.0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scans_codex_all_time_sessions_outside_rolling_window() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+
+        let old_dir = sessions_dir.join("2024").join("01").join("02");
+        fs::create_dir_all(&old_dir).unwrap();
+        let old_path = old_dir.join("old.jsonl");
+        write_codex_token_count(
+            &old_path,
+            "2024-01-02T08:00:00.000Z",
+            "gpt-5.5",
+            300,
+            50,
+            70,
+        );
+
+        let today = Utc::now().date_naive();
+        let today_dir = sessions_dir
+            .join(today.format("%Y").to_string())
+            .join(today.format("%m").to_string())
+            .join(today.format("%d").to_string());
+        fs::create_dir_all(&today_dir).unwrap();
+        let today_path = today_dir.join("today.jsonl");
+        write_codex_token_count(
+            &today_path,
+            &format!("{}T08:00:00.000Z", today.format("%Y-%m-%d")),
+            "gpt-5.5",
+            20,
+            5,
+            4,
+        );
+
+        let scanner = CostScanner::new(30).with_cache_root(temp.path().join("cache"));
+        let rolling = scanner.scan_codex_sessions_dir(&sessions_dir);
+        let all_time = scanner.scan_codex_sessions_dir_all_time(&sessions_dir);
+
+        assert_eq!(
+            rolling
+                .by_model_tokens
+                .get("gpt-5.5")
+                .map(ModelTokenCounts::total),
+            Some(24)
+        );
+        assert_eq!(
+            all_time
+                .by_model_tokens
+                .get("gpt-5.5")
+                .map(ModelTokenCounts::total),
+            Some(394)
+        );
+    }
+
+    #[test]
+    fn scans_codex_today_events_from_sessions_started_on_older_days() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+
+        let today = Utc::now().date_naive();
+        let older = today - Duration::days(2);
+        let older_dir = sessions_dir
+            .join(older.format("%Y").to_string())
+            .join(older.format("%m").to_string())
+            .join(older.format("%d").to_string());
+        fs::create_dir_all(&older_dir).unwrap();
+        let path = older_dir.join("resumed-today.jsonl");
+        write_codex_token_count(
+            &path,
+            &format!("{}T08:00:00.000Z", today.format("%Y-%m-%d")),
+            "gpt-5.5",
+            900,
+            100,
+            60,
+        );
+
+        let scanner = CostScanner::new(1).with_cache_root(temp.path().join("cache"));
+        let summary = scanner.scan_codex_sessions_dir(&sessions_dir);
+
+        assert_eq!(summary.sessions_count, 1);
+        assert_eq!(
+            summary
+                .by_model_tokens
+                .get("gpt-5.5")
+                .map(ModelTokenCounts::total),
+            Some(960)
+        );
+    }
+
+    #[test]
+    fn scans_codex_today_events_from_older_sessions_as_deltas() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+
+        let today = Utc::now().date_naive();
+        let older = today - Duration::days(2);
+        let older_dir = sessions_dir
+            .join(older.format("%Y").to_string())
+            .join(older.format("%m").to_string())
+            .join(older.format("%d").to_string());
+        fs::create_dir_all(&older_dir).unwrap();
+        let path = older_dir.join("resumed-with-baseline.jsonl");
+        write_codex_token_count(
+            &path,
+            &format!("{}T08:00:00.000Z", older.format("%Y-%m-%d")),
+            "gpt-5.5",
+            1_000,
+            300,
+            80,
+        );
+        write_codex_token_count_append(
+            &path,
+            &format!("{}T08:00:00.000Z", today.format("%Y-%m-%d")),
+            "gpt-5.5",
+            1_250,
+            360,
+            125,
+        );
+
+        let scanner = CostScanner::new(1).with_cache_root(temp.path().join("cache"));
+        let summary = scanner.scan_codex_sessions_dir(&sessions_dir);
+
+        assert_eq!(summary.input_tokens, 250);
+        assert_eq!(summary.cached_tokens, 60);
+        assert_eq!(summary.output_tokens, 45);
+        assert_eq!(
+            summary
+                .by_model_tokens
+                .get("gpt-5.5")
+                .map(ModelTokenCounts::total),
+            Some(295)
+        );
+    }
+
+    #[test]
+    fn scans_codex_one_day_as_current_calendar_day_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+
+        let today = Utc::now().date_naive();
+        let yesterday = today - Duration::days(1);
+        let session_dir = sessions_dir
+            .join(yesterday.format("%Y").to_string())
+            .join(yesterday.format("%m").to_string())
+            .join(yesterday.format("%d").to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        let path = session_dir.join("yesterday-started.jsonl");
+        write_codex_token_count(
+            &path,
+            &format!("{}T18:00:00.000Z", yesterday.format("%Y-%m-%d")),
+            "gpt-5.5",
+            1_000,
+            300,
+            80,
+        );
+        write_codex_token_count_append(
+            &path,
+            &format!("{}T08:00:00.000Z", today.format("%Y-%m-%d")),
+            "gpt-5.5",
+            1_250,
+            360,
+            125,
+        );
+
+        let scanner = CostScanner::new(1).with_cache_root(temp.path().join("cache"));
+        let summary = scanner.scan_codex_sessions_dir(&sessions_dir);
+
+        assert_eq!(summary.input_tokens, 250);
+        assert_eq!(summary.cached_tokens, 60);
+        assert_eq!(summary.output_tokens, 45);
+    }
+
+    #[test]
+    fn scans_codex_sessions_dir_persists_file_cache() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_dir = temp.path().join("sessions");
+        let cache_root = temp.path().join("cache");
+
+        let today = Utc::now().date_naive();
+        let today_dir = sessions_dir
+            .join(today.format("%Y").to_string())
+            .join(today.format("%m").to_string())
+            .join(today.format("%d").to_string());
+        fs::create_dir_all(&today_dir).unwrap();
+        write_codex_token_count(
+            &today_dir.join("today.jsonl"),
+            &format!("{}T08:00:00.000Z", today.format("%Y-%m-%d")),
+            "gpt-5.5",
+            100,
+            20,
+            10,
+        );
+
+        let scanner = CostScanner::new(1).with_cache_root(cache_root.clone());
+        let summary = scanner.scan_codex_sessions_dir(&sessions_dir);
+
+        assert_eq!(summary.input_tokens, 100);
+        let cache_path = cache_root.join("codex_cost_cache.json");
+        assert!(
+            cache_path.exists(),
+            "expected Codex scanner to persist a reusable file cache"
+        );
+        let cache_json = fs::read_to_string(cache_path).unwrap();
+        let cache: crate::core::CostUsageCache = serde_json::from_str(&cache_json).unwrap();
+        assert_eq!(cache.files.len(), 1);
+    }
+
+    fn write_codex_token_count(
+        path: &Path,
+        timestamp: &str,
+        model: &str,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        let mut file = File::create(path).unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"model":"{model}","total_token_usage":{{"input_tokens":{input_tokens},"cached_input_tokens":{cached_input_tokens},"output_tokens":{output_tokens}}}}}}}}}"#
+        )
+        .unwrap();
+    }
+
+    fn write_codex_token_count_append(
+        path: &Path,
+        timestamp: &str,
+        model: &str,
+        input_tokens: u64,
+        cached_input_tokens: u64,
+        output_tokens: u64,
+    ) {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(
+            file,
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"model":"{model}","total_token_usage":{{"input_tokens":{input_tokens},"cached_input_tokens":{cached_input_tokens},"output_tokens":{output_tokens}}}}}}}}}"#
+        )
+        .unwrap();
     }
 }

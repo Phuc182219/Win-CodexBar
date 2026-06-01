@@ -18,6 +18,7 @@ const tauriMocks = vi.hoisted(() => ({
   quitApp: vi.fn(),
   getWorkAreaRect: vi.fn(),
   reanchorTrayPanel: vi.fn(),
+  startTrayPanelDrag: vi.fn(),
   openProviderDashboard: vi.fn(),
   openProviderStatusPage: vi.fn(),
   getProviderChartData: vi.fn(),
@@ -30,13 +31,19 @@ const eventMocks = vi.hoisted(() => ({
   listen: vi.fn(),
 }));
 
-const windowMocks = vi.hoisted(() => ({
-  getCurrentWindow: vi.fn(() => ({
+const windowMocks = vi.hoisted(() => {
+  const currentWindow = {
     setSize: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
-  })),
-  LogicalSize: vi.fn((width: number, height: number) => ({ width, height })),
-}));
+    outerPosition: vi.fn().mockResolvedValue({ x: 100, y: 200 }),
+    scaleFactor: vi.fn().mockResolvedValue(1),
+  };
+  return {
+    currentWindow,
+    getCurrentWindow: vi.fn(() => currentWindow),
+    LogicalSize: vi.fn((width: number, height: number) => ({ width, height })),
+  };
+});
 
 vi.mock("../lib/tauri", () => tauriMocks);
 vi.mock("@tauri-apps/api/event", () => eventMocks);
@@ -142,6 +149,19 @@ function bootstrap(settingsOverrides: Partial<SettingsSnapshot> = {}): Bootstrap
   };
 }
 
+function idleUpdateState() {
+  return {
+    status: "idle",
+    version: null,
+    error: null,
+    progress: null,
+    releaseUrl: null,
+    canDownload: false,
+    canApply: false,
+    lastCheckedAt: null,
+  };
+}
+
 function renderTrayPanel(
   providers: ProviderUsageSnapshot[],
   settingsOverrides: Partial<SettingsSnapshot> = {},
@@ -155,11 +175,29 @@ function renderTrayPanel(
   );
 }
 
+function dispatchPointerEvent(
+  target: HTMLElement,
+  type: string,
+  props: Record<string, number>,
+) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  for (const [key, value] of Object.entries(props)) {
+    Object.defineProperty(event, key, {
+      configurable: true,
+      value,
+    });
+  }
+  fireEvent(target, event);
+}
+
 describe("TrayPanel provider grid", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    windowMocks.getCurrentWindow.mockReturnValue(windowMocks.currentWindow);
     tauriMocks.refreshProviders.mockResolvedValue(undefined);
     tauriMocks.refreshProvidersIfStale.mockResolvedValue(undefined);
+    tauriMocks.reanchorTrayPanel.mockResolvedValue(undefined);
+    tauriMocks.startTrayPanelDrag.mockResolvedValue(undefined);
     tauriMocks.getWorkAreaRect.mockResolvedValue({
       x: 0,
       y: 0,
@@ -171,16 +209,7 @@ describe("TrayPanel provider grid", () => {
       target: { kind: "summary" },
     });
     tauriMocks.getSettingsSnapshot.mockResolvedValue(settings());
-    tauriMocks.getUpdateState.mockResolvedValue({
-      status: "idle",
-      version: null,
-      error: null,
-      progress: null,
-      releaseUrl: null,
-      canDownload: false,
-      canApply: false,
-      lastCheckedAt: null,
-    });
+    tauriMocks.getUpdateState.mockResolvedValue(idleUpdateState());
     tauriMocks.getProviderChartData.mockResolvedValue({
       providerId: "codex",
       costHistory: [],
@@ -361,6 +390,8 @@ describe("TrayPanel provider grid", () => {
     windowMocks.getCurrentWindow.mockReturnValue({
       setSize: vi.fn().mockRejectedValue(new Error("resize failed")),
       close: vi.fn().mockResolvedValue(undefined),
+      outerPosition: vi.fn().mockResolvedValue({ x: 100, y: 200 }),
+      scaleFactor: vi.fn().mockResolvedValue(1),
     });
 
     const { container } = renderTrayPanel([provider("claude", "Claude", 35)]);
@@ -370,5 +401,74 @@ describe("TrayPanel provider grid", () => {
     });
 
     warn.mockRestore();
+  });
+
+  it("resizes the tray window when dismissing the update banner", async () => {
+    tauriMocks.getUpdateState.mockResolvedValue({
+      status: "available",
+      version: "v0.30.2",
+      error: null,
+      progress: null,
+      releaseUrl: "https://example.test/release",
+      canDownload: true,
+      canApply: false,
+      lastCheckedAt: 1,
+    });
+    tauriMocks.dismissUpdate.mockResolvedValue(idleUpdateState());
+
+    const { container } = renderTrayPanel([provider("codex", "Codex")]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".update-banner")).not.toBeNull();
+    });
+    await waitFor(
+      () => {
+        expect(container.querySelector(".tray-panel-reveal--ready")).not.toBeNull();
+      },
+      { timeout: 3000 },
+    );
+
+    windowMocks.currentWindow.setSize.mockClear();
+
+    fireEvent.click(
+      container.querySelector<HTMLButtonElement>(
+        ".update-banner__action--dismiss",
+      )!,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".update-banner")).toBeNull();
+    });
+    await waitFor(() => {
+      expect(windowMocks.currentWindow.setSize).toHaveBeenCalled();
+    });
+  });
+
+  it("starts native tray dragging from the drag handle", async () => {
+    const { container } = renderTrayPanel([provider("codex", "Codex")]);
+
+    await waitFor(() => {
+      expect(container.querySelector(".menu-surface__drag-handle")).not.toBeNull();
+    });
+
+    const handle = container.querySelector<HTMLElement>(
+      ".menu-surface__drag-handle",
+    );
+    expect(handle).not.toBeNull();
+    expect(handle?.hasAttribute("data-tauri-drag-region")).toBe(false);
+
+    tauriMocks.startTrayPanelDrag.mockResolvedValue(undefined);
+    dispatchPointerEvent(handle!, "pointerdown", {
+      button: 0,
+      pointerId: 1,
+      clientX: 400,
+      clientY: 300,
+      screenX: 400,
+      screenY: 300,
+    });
+
+    await waitFor(() => {
+      expect(tauriMocks.startTrayPanelDrag).toHaveBeenCalledTimes(1);
+    });
   });
 });

@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use codexbar::core::ProviderId;
 use serde::Serialize;
@@ -142,7 +143,10 @@ pub struct AppState {
     pub notification_manager: codexbar::notifications::NotificationManager,
     /// Instant when the tray panel was last shown — used to suppress
     /// spurious blur-dismiss during the show animation on Windows.
-    pub last_shown_at: Option<std::time::Instant>,
+    pub last_shown_at: Option<Instant>,
+    /// Deadline for ignoring tray-panel blur events while a native window
+    /// drag is starting/running.
+    pub tray_drag_blur_suppressed_until: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -182,6 +186,7 @@ impl AppState {
             proof_config: None,
             notification_manager: codexbar::notifications::NotificationManager::new(),
             last_shown_at: None,
+            tray_drag_blur_suppressed_until: None,
         }
     }
 
@@ -205,8 +210,55 @@ impl AppState {
         let next_target = Self::resolved_target_for_mode(mode, target);
         let transition = self.surface_machine.transition(mode);
         self.current_target = next_target;
+        if mode != SurfaceMode::TrayPanel {
+            self.tray_drag_blur_suppressed_until = None;
+        }
 
         transition
+    }
+
+    pub fn suppress_tray_drag_blur_for(&mut self, duration: Duration) {
+        self.suppress_tray_drag_blur_until(Instant::now() + duration);
+    }
+
+    pub fn suppress_tray_drag_blur_until(&mut self, until: Instant) {
+        if self.surface_machine.current() == SurfaceMode::TrayPanel {
+            self.tray_drag_blur_suppressed_until = Some(until);
+        } else {
+            self.tray_drag_blur_suppressed_until = None;
+        }
+    }
+
+    pub fn should_suppress_tray_blur_dismiss(&mut self, now: Instant) -> bool {
+        if self.surface_machine.current() != SurfaceMode::TrayPanel {
+            self.tray_drag_blur_suppressed_until = None;
+            return false;
+        }
+
+        match self.tray_drag_blur_suppressed_until {
+            Some(deadline) if deadline >= now => true,
+            Some(_) => {
+                self.tray_drag_blur_suppressed_until = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    pub fn extend_tray_drag_blur_suppression_for(&mut self, duration: Duration) {
+        let now = Instant::now();
+        self.extend_tray_drag_blur_suppression_until(now, now + duration);
+    }
+
+    pub fn extend_tray_drag_blur_suppression_until(&mut self, now: Instant, until: Instant) {
+        if !self.should_suppress_tray_blur_dismiss(now) {
+            return;
+        }
+
+        match self.tray_drag_blur_suppressed_until {
+            Some(current) if current >= until => {}
+            _ => self.tray_drag_blur_suppressed_until = Some(until),
+        }
     }
 
     /// Build an enriched update payload using the stored update info.
@@ -233,6 +285,7 @@ mod tests {
     use super::AppState;
     use crate::surface::SurfaceMode;
     use crate::surface_target::SurfaceTarget;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn transition_applies_explicit_target_on_mode_change() {
@@ -349,5 +402,44 @@ mod tests {
         );
 
         assert_eq!(state.current_target, SurfaceTarget::Dashboard);
+    }
+
+    #[test]
+    fn tray_drag_blur_suppression_is_active_until_deadline() {
+        let mut state = AppState::new();
+        state.transition_surface(SurfaceMode::TrayPanel, SurfaceTarget::Summary);
+        let now = Instant::now();
+
+        state.suppress_tray_drag_blur_until(now + Duration::from_millis(500));
+
+        assert!(state.should_suppress_tray_blur_dismiss(now + Duration::from_millis(499)));
+        assert!(!state.should_suppress_tray_blur_dismiss(now + Duration::from_millis(501)));
+        assert!(state.tray_drag_blur_suppressed_until.is_none());
+    }
+
+    #[test]
+    fn tray_drag_blur_suppression_only_applies_to_tray_panel() {
+        let mut state = AppState::new();
+        let now = Instant::now();
+
+        state.suppress_tray_drag_blur_until(now + Duration::from_millis(500));
+
+        assert!(!state.should_suppress_tray_blur_dismiss(now + Duration::from_millis(100)));
+        assert!(state.tray_drag_blur_suppressed_until.is_none());
+    }
+
+    #[test]
+    fn tray_drag_blur_suppression_extends_while_active() {
+        let mut state = AppState::new();
+        state.transition_surface(SurfaceMode::TrayPanel, SurfaceTarget::Summary);
+        let now = Instant::now();
+
+        state.suppress_tray_drag_blur_until(now + Duration::from_millis(100));
+        state.extend_tray_drag_blur_suppression_until(
+            now + Duration::from_millis(50),
+            now + Duration::from_millis(400),
+        );
+
+        assert!(state.should_suppress_tray_blur_dismiss(now + Duration::from_millis(300)));
     }
 }

@@ -3918,6 +3918,42 @@ html:has(.menu-surface--tray) {
   box-shadow: none;
 }
 
+.menu-surface__drag-handle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 11px;
+  padding: 3px 0 2px;
+  cursor: grab;
+  -webkit-app-region: no-drag;
+  touch-action: none;
+  user-select: none;
+}
+
+.menu-surface__drag-handle:active {
+  cursor: grabbing;
+}
+
+.menu-surface__drag-grip {
+  width: 36px;
+  height: 3px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.26);
+  pointer-events: none;
+}
+
+.menu-surface__drag-handle:hover .menu-surface__drag-grip {
+  background: rgba(255, 255, 255, 0.38);
+}
+
+[data-theme="light"] .menu-surface__drag-grip {
+  background: rgba(0, 0, 0, 0.20);
+}
+
+[data-theme="light"] .menu-surface__drag-handle:hover .menu-surface__drag-grip {
+  background: rgba(0, 0, 0, 0.30);
+}
+
 .menu-surface__header {
   min-height: 20px;
   padding: 0;

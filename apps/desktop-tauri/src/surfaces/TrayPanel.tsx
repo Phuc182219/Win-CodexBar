@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type { BootstrapState, ProviderUsageSnapshot } from "../types/bridge";
 import { setSurfaceMode, openSettingsWindow, quitApp as quitApplication } from "../lib/tauri";
-import { getWorkAreaRect, reanchorTrayPanel } from "../lib/tauri";
+import { getWorkAreaRect, reanchorTrayPanel, startTrayPanelDrag } from "../lib/tauri";
 import { useProviders } from "../hooks/useProviders";
 import { useSettings } from "../hooks/useSettings";
 import { useUpdateState } from "../hooks/useUpdateState";
@@ -79,6 +80,14 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
     useUpdateState();
   const { t } = useLocale();
   const surfaceTarget = useSurfaceTarget("trayPanel");
+  const updateLayoutKey = [
+    updateState.status,
+    updateState.version ?? "",
+    updateState.error ?? "",
+    updateState.progress ?? "",
+    updateState.canDownload ? "download" : "",
+    updateState.canApply ? "apply" : "",
+  ].join("|");
 
   const sorted = useMemo(() => sortProviders(providers), [providers]);
   const initialProviderId =
@@ -99,8 +108,34 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   const [layoutReady, setLayoutReady] = useState(false);
   const [layoutRevision, setLayoutRevision] = useState(0);
   const layoutReadyRef = useRef(false);
+  const panelMountedRef = useRef(true);
+  const manualPositionRef = useRef(false);
   const resizeRunRef = useRef(0);
   const layoutTimerRef = useRef<number | undefined>(undefined);
+  const markManualPosition = useCallback(() => {
+    manualPositionRef.current = true;
+  }, []);
+
+  const handleDragPointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button > 0) return;
+      event.preventDefault();
+      event.stopPropagation();
+      markManualPosition();
+      void startTrayPanelDrag().catch(() => {});
+    },
+    [markManualPosition],
+  );
+
+  useEffect(() => {
+    panelMountedRef.current = true;
+    return () => {
+      panelMountedRef.current = false;
+      if (layoutTimerRef.current !== undefined) {
+        window.clearTimeout(layoutTimerRef.current);
+      }
+    };
+  }, []);
 
   // Cards to display based on mode
   // Overview: all providers in the grid — non-error first, then errors
@@ -131,20 +166,14 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
   }, [sorted, selectedProviderId, gridExpanded]);
 
   const handleMenuCardLayoutChange = useCallback(() => {
+    if (!panelMountedRef.current) return;
     if (layoutTimerRef.current !== undefined) {
       window.clearTimeout(layoutTimerRef.current);
     }
     layoutTimerRef.current = window.setTimeout(() => {
+      if (!panelMountedRef.current) return;
       setLayoutRevision((current) => current + 1);
     }, 50);
-  }, []);
-
-  useEffect(() => {
-    return () => {
-      if (layoutTimerRef.current !== undefined) {
-        window.clearTimeout(layoutTimerRef.current);
-      }
-    };
   }, []);
 
   // Dynamically size the Tauri window to fit content, capped at 800px.
@@ -237,7 +266,9 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         committedHeight = true;
 
         await win.setSize(new LogicalSize(TRAY_WIDTH, height));
-        await reanchorTrayPanel().catch(() => {});
+        if (!manualPositionRef.current) {
+          await reanchorTrayPanel().catch(() => {});
+        }
 
         // First layout pass complete — reveal the panel.
         revealPanel();
@@ -270,7 +301,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       clearTimeout(t0);
       resizeRunRef.current += 1;
     };
-  }, [visibleProviders, providers, layoutRevision]);
+  }, [visibleProviders, providers, layoutRevision, updateLayoutKey]);
 
   const openSettings = useCallback(() => {
     void openSettingsWindow("general").finally(() => {
@@ -348,6 +379,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
         onRefresh={refresh}
         isRefreshing={isRefreshing}
         actions={headerActions}
+        onDragHandlePointerDown={handleDragPointerDown}
         banner={banner}
         footerRows={footerRows}
       >
@@ -367,6 +399,7 @@ export default function TrayPanel({ state }: { state: BootstrapState }) {
       onRefresh={refresh}
       isRefreshing={isRefreshing}
       actions={headerActions}
+      onDragHandlePointerDown={handleDragPointerDown}
       banner={banner}
       footerRows={footerRows}
     >

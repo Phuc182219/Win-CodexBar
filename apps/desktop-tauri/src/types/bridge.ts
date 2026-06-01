@@ -416,6 +416,8 @@ export interface ProviderLocalUsageSummary {
   todayCost: number | null;
   thirtyDayCost: number | null;
   thirtyDayTokens: number | null;
+  allTimeCost: number | null;
+  allTimeTokens: number | null;
   latestTokens: number | null;
   topModel: string | null;
   estimateNote: string;

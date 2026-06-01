@@ -46,6 +46,8 @@ pub struct ProviderLocalUsageSummary {
     pub today_cost: Option<f64>,
     pub thirty_day_cost: Option<f64>,
     pub thirty_day_tokens: Option<u64>,
+    pub all_time_cost: Option<f64>,
+    pub all_time_tokens: Option<u64>,
     pub latest_tokens: Option<u64>,
     pub top_model: Option<String>,
     pub estimate_note: String,
@@ -79,6 +81,7 @@ pub async fn get_provider_chart_data(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn build_provider_chart_data(
     provider_id: String,
     account_email: Option<String>,
@@ -153,11 +156,30 @@ fn load_local_usage_summary(
         return None;
     }
     let today = scan_local_cost(provider_id, 1, cancel).unwrap_or_default();
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return None;
+    }
+    let all_time = scan_local_all_time_cost(provider_id, cancel);
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return None;
+    }
 
     let thirty_day_tokens = total_tokens(&thirty_day);
     let latest_tokens = total_tokens(&today);
-    let has_usage =
-        thirty_day.sessions_count > 0 || thirty_day.total_cost_usd > 0.0 || thirty_day_tokens > 0;
+    let all_time_tokens = all_time.as_ref().map(total_tokens);
+    let all_time_has_usage = all_time.as_ref().is_some_and(|summary| {
+        summary.sessions_count > 0
+            || summary.total_cost_usd > 0.0
+            || all_time_tokens.is_some_and(|tokens| tokens > 0)
+    });
+    let top_model = all_time
+        .as_ref()
+        .and_then(top_model)
+        .or_else(|| top_model(&thirty_day));
+    let has_usage = thirty_day.sessions_count > 0
+        || thirty_day.total_cost_usd > 0.0
+        || thirty_day_tokens > 0
+        || all_time_has_usage;
     if !has_usage {
         return None;
     }
@@ -166,8 +188,12 @@ fn load_local_usage_summary(
         today_cost: non_zero_f64(today.total_cost_usd),
         thirty_day_cost: non_zero_f64(thirty_day.total_cost_usd),
         thirty_day_tokens: non_zero_u64(thirty_day_tokens),
+        all_time_cost: all_time
+            .as_ref()
+            .and_then(|summary| non_zero_f64(summary.total_cost_usd)),
+        all_time_tokens: all_time_tokens.and_then(non_zero_u64),
         latest_tokens: non_zero_u64(latest_tokens),
-        top_model: top_model(&thirty_day),
+        top_model,
         estimate_note: match provider_id {
             "claude" => "Estimated from local Claude logs at API rates; token totals may differ from your bill",
             _ => "Estimated from local logs; may differ from your bill",
@@ -185,6 +211,13 @@ fn scan_local_cost(
     match provider_id {
         "codex" => Some(scanner.scan_codex_with_cancel(cancel)),
         "claude" => Some(scanner.scan_claude_with_cancel(cancel)),
+        _ => None,
+    }
+}
+
+fn scan_local_all_time_cost(provider_id: &str, cancel: Option<&AtomicBool>) -> Option<CostSummary> {
+    match provider_id {
+        "codex" => Some(CostScanner::new(30).scan_codex_all_time_with_cancel(cancel)),
         _ => None,
     }
 }
